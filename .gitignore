@@ -1,0 +1,16 @@
+api/crypto-api.exe
+api/crypto-api
+frontend/node_modules
+frontend/dist
+**/__pycache__
+*.pyc
+.env
+.tools/
+*.md
+!README.md
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+credentials.json

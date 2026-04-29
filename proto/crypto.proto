@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package crypto.v1;
+
+option go_package = "crypto-api/internal/gen/cryptopb;cryptopb";
+
+service CryptoService {
+  rpc GetCryptoList (GetCryptoListRequest) returns (GetCryptoListResponse);
+}
+
+message GetCryptoListRequest {
+  string source = 1;
+}
+
+message CryptoRow {
+  string symbol = 1;
+  double last = 2;
+  double percentage = 3;
+  double volume = 4;
+  double high = 5;
+  double low = 6;
+  string exchange = 7;
+}
+
+message CryptoError {
+  string exchange = 1;
+  string symbol = 2;
+  string message = 3;
+}
+
+message GetCryptoListResponse {
+  bool success = 1;
+  repeated CryptoRow data = 2;
+  repeated CryptoError errors = 3;
+  bool partial = 4;
+}
