@@ -15,6 +15,24 @@ Data flow:
 2. Go API calls Python service via gRPC (`GetCryptoList`).
 3. Python responds with market data from selected source (`all`, `okx`, `btcturk`).
 
+## Screenshots & demo
+
+PNG previews are in [`images/`](images/); a screen recording is in [`videos/`](videos/).
+
+<p align="center">
+  <img src="images/cTümü-Açık.png" width="48%" alt="UI: all sources, overview" />
+  <img src="images/cTümü-kayıtlar.png" width="48%" alt="UI: all sources, records" />
+</p>
+<p align="center">
+  <img src="images/cTümü-sistem.png" width="48%" alt="UI: all sources, system" />
+  <img src="images/cSistem-Btc.png" width="48%" alt="UI: BTCTurk source" />
+</p>
+<p align="center">
+  <img src="images/cSistem-okx.png" width="70%" alt="UI: OKX source" />
+</p>
+
+**Demo video:** [screen recording](videos/Crypto%20Dashboard%20-%20Ki%C5%9Fisel%20-%20Microsoft%E2%80%8B%20Edge%202026-05-11%2018-18-42.mp4) (Edge export; the filename contains a zero-width space after “Microsoft”, which is why a plain copy-paste link can break).
+
 ## Environment Variables
 
 | Service | Variable | Default |
