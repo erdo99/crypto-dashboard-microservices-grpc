@@ -11,9 +11,19 @@ Polyglot crypto dashboard with React frontend, Go API gateway, and Python market
 
 Data flow:
 
-1. Frontend calls Go REST API.
-2. Go API calls Python service via gRPC (`GetCryptoList`).
-3. Python responds with market data from selected source (`all`, `okx`, `btcturk`).
+1. Frontend calls Go REST API (JSON over HTTP).
+2. Go API calls Python service via gRPC (`GetCryptoList`) using a **reused** gRPC client (one connection per API process).
+3. Python fetches market data and returns rows to Go, which responds to the browser.
+
+### Data sources (`source` query param)
+
+| Value | Behavior |
+|---|---|
+| `btcturk` | Single REST call to BTCTurk ticker API (~fastest). |
+| `okx` | CCXT OKX: targeted symbol tickers (not full-market `fetch_tickers` unless `CCXT_USE_FULL_TICKERS=true`). |
+| `all` (UI default) | **BTCTurk first**; OKX only if BTCTurk returns no rows. Same speed profile as `btcturk` in normal conditions (~3–5s cold). |
+
+Responses are cached in Python for **`CRYPTO_CACHE_TTL_SECONDS`** (default 8s) per `source`. When `all` is served from BTCTurk, the `btcturk` cache entry is warmed too.
 
 ## Screenshots & demo
 
@@ -38,6 +48,9 @@ PNG previews are in [`images/`](images/); a screen recording is in [`videos/`](v
 | Service | Variable | Default |
 |---|---|---|
 | Python gRPC | `PORT` | `5000` (HTTP app, optional) |
+| Python | `CRYPTO_CACHE_TTL_SECONDS` | `8` (`0` disables in-memory cache) |
+| Python | `CCXT_SYMBOL_WORKERS` | `6` (parallel per-symbol OKX fetches) |
+| Python | `CCXT_USE_FULL_TICKERS` | unset (`true` restores full-market OKX `fetch_tickers`) |
 | Go API | `PORT` | `8080` |
 | Go API | `CCXT_GRPC_ADDR` | `localhost:50051` |
 | Go API | `PYTHON_GRPC_TIMEOUT_SECONDS` | `45` |
@@ -80,5 +93,7 @@ Open: `http://localhost:5174`
 
 ## Notes
 
-- Inter-service transport is gRPC/Protobuf (Go -> Python).
-- Frontend communication remains REST (Frontend -> Go).
+- Inter-service transport is gRPC/Protobuf (Go → Python). The browser does **not** call gRPC directly.
+- Frontend communication remains REST (Frontend → Go).
+- `source=all` usually shows **BTCTurk** rows (13/14 symbols); use `source=okx` for full OKX coverage (slower cold fetch).
+- Local smoke tests can live under `scripts/` (not required to run the app).
