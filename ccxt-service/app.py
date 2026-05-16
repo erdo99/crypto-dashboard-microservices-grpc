@@ -1,6 +1,8 @@
 # Flask + CCXT: OKX ana kaynak, BTCTurk fallback.
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import ccxt
@@ -26,6 +28,60 @@ CCXT_EXCHANGE_CANDIDATES = ["okx"]
 SYMBOL_ALIASES = {
     "MATIC/USDT": ["MATIC/USDT", "POL/USDT"],
 }
+CACHE_TTL_SECONDS = max(0, int(os.environ.get("CRYPTO_CACHE_TTL_SECONDS", "8")))
+_cache_lock = Lock()
+# source -> (expires_at, payload dict with data/errors/partial/used_ccxt)
+_response_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _candidate_symbols(symbols: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for symbol in symbols:
+        for candidate in SYMBOL_ALIASES.get(symbol, [symbol]):
+            if candidate not in seen:
+                seen.add(candidate)
+                out.append(candidate)
+    return out
+
+
+def _fetch_symbols_parallel(
+    ex,
+    exchange_id: str,
+    symbols: list[str],
+) -> tuple[dict[str, dict], list[dict]]:
+    symbol_rows: dict[str, dict] = {}
+    exchange_errors: list[dict] = []
+    max_workers = int(os.environ.get("CCXT_SYMBOL_WORKERS", "6"))
+    max_workers = max(1, min(max_workers, len(symbols)))
+
+    def _fetch_one_symbol(symbol: str):
+        candidates = SYMBOL_ALIASES.get(symbol, [symbol])
+        last_error = None
+        for candidate_symbol in candidates:
+            try:
+                ticker = ex.fetch_ticker(candidate_symbol)
+                return symbol, _normalize_ticker(exchange_id, symbol, ticker), None
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+        return symbol, None, {
+            "exchange": exchange_id,
+            "symbol": symbol,
+            "message": str(last_error or "ticker not found"),
+        }
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_fetch_one_symbol, symbol) for symbol in symbols]
+        for future in as_completed(futures):
+            symbol, row, err = future.result()
+            if row is not None:
+                symbol_rows[symbol] = row
+            elif err is not None:
+                exchange_errors.append(err)
+
+    return symbol_rows, exchange_errors
+
+
 BTCTURK_PAIR_MAP = {
     "BTC/USDT": "BTCUSDT",
     "ETH/USDT": "ETHUSDT",
@@ -64,7 +120,7 @@ def _to_float(value) -> float:
 
 
 def _fetch_single_exchange(exchange_id: str, symbols: list[str]) -> tuple[str, dict[str, dict], list[dict]]:
-    exchange_errors = []
+    exchange_errors: list[dict] = []
     symbol_rows: dict[str, dict] = {}
 
     exchange_cls = getattr(ccxt, exchange_id, None)
@@ -72,15 +128,28 @@ def _fetch_single_exchange(exchange_id: str, symbols: list[str]) -> tuple[str, d
         return exchange_id, symbol_rows, [{"exchange": exchange_id, "symbol": "*", "message": "exchange class not found"}]
 
     ex = exchange_cls({"enableRateLimit": True, "timeout": 7000})
-    print(f"[ccxt-service] CCXT {exchange_id} fetch started")
-    all_tickers = {}
+    print(f"[ccxt-service] CCXT {exchange_id} fetch started (target_symbols={len(symbols)})")
 
-    try:
-        if ex.has.get("fetchTickers"):
-            all_tickers = ex.fetch_tickers()
-    except Exception as e:  # noqa: BLE001
-        exchange_errors.append({"exchange": exchange_id, "symbol": "*", "message": f"fetch_tickers failed: {e}"})
-        all_tickers = {}
+    use_full_tickers = os.environ.get("CCXT_USE_FULL_TICKERS", "").strip().lower() in {"1", "true", "yes"}
+    ticker_candidates = _candidate_symbols(symbols)
+    all_tickers: dict = {}
+
+    if use_full_tickers:
+        try:
+            if ex.has.get("fetchTickers"):
+                all_tickers = ex.fetch_tickers()
+        except Exception as e:  # noqa: BLE001
+            exchange_errors.append({"exchange": exchange_id, "symbol": "*", "message": f"fetch_tickers failed: {e}"})
+            all_tickers = {}
+    else:
+        try:
+            if ex.has.get("fetchTickers") and ticker_candidates:
+                all_tickers = ex.fetch_tickers(ticker_candidates)
+        except TypeError:
+            all_tickers = {}
+        except Exception as e:  # noqa: BLE001
+            exchange_errors.append({"exchange": exchange_id, "symbol": "*", "message": f"fetch_tickers(symbols) failed: {e}"})
+            all_tickers = {}
 
     if all_tickers:
         for symbol in symbols:
@@ -99,32 +168,17 @@ def _fetch_single_exchange(exchange_id: str, symbols: list[str]) -> tuple[str, d
                     last_error = e
 
             if ticker is None:
-                exchange_errors.append({"exchange": exchange_id, "symbol": symbol, "message": str(last_error or "ticker not found")})
+                exchange_errors.append(
+                    {"exchange": exchange_id, "symbol": symbol, "message": str(last_error or "ticker not found")}
+                )
                 continue
             symbol_rows[symbol] = _normalize_ticker(exchange_id, symbol, ticker)
-    else:
-        max_workers = int(os.environ.get("CCXT_SYMBOL_WORKERS", "4"))
-        max_workers = max(1, min(max_workers, len(symbols)))
 
-        def _fetch_one_symbol(symbol: str):
-            candidates = SYMBOL_ALIASES.get(symbol, [symbol])
-            last_error = None
-            for candidate_symbol in candidates:
-                try:
-                    ticker = ex.fetch_ticker(candidate_symbol)
-                    return symbol, _normalize_ticker(exchange_id, symbol, ticker), None
-                except Exception as e:  # noqa: BLE001
-                    last_error = e
-            return symbol, None, {"exchange": exchange_id, "symbol": symbol, "message": str(last_error or "ticker not found")}
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_fetch_one_symbol, symbol) for symbol in symbols]
-            for future in as_completed(futures):
-                symbol, row, err = future.result()
-                if row is not None:
-                    symbol_rows[symbol] = row
-                elif err is not None:
-                    exchange_errors.append(err)
+    missing = [s for s in symbols if s not in symbol_rows]
+    if missing:
+        parallel_rows, parallel_errors = _fetch_symbols_parallel(ex, exchange_id, missing)
+        symbol_rows.update(parallel_rows)
+        exchange_errors.extend(parallel_errors)
 
     if symbol_rows:
         print(f"[ccxt-service] CCXT {exchange_id} fetch finished: data={len(symbol_rows)}")
@@ -178,34 +232,20 @@ def _fetch_from_okx(symbols: list[str]) -> tuple[list[dict], list[dict], list[st
     return ordered_rows, exchange_errors, used
 
 
-def _fetch_all_first_wins(symbols: list[str]) -> tuple[list[dict], list[dict], list[str]]:
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {
-            executor.submit(_fetch_from_okx, symbols): "okx",
-            executor.submit(_fallback_from_btcturk, symbols): "btcturk",
-        }
-        collected_errors = []
-        first_source = None
+def _fetch_all_btcturk_first(symbols: list[str]) -> tuple[list[dict], list[dict], list[str]]:
+    """source=all: fast BTCTurk HTTP first; OKX only when BTCTurk returns no rows.
 
-        for future in as_completed(futures):
-            source = futures[future]
-            try:
-                if source == "okx":
-                    data, errs, _ = future.result()
-                else:
-                    data, errs = future.result()
-                collected_errors.extend(errs)
-                if data:
-                    first_source = source
-                    print(f"[ccxt-service] all-first-wins source={source} data={len(data)}")
-                    if source == "okx":
-                        return data, collected_errors, ["okx"]
-                    return data, collected_errors, ["btcturk"]
-            except Exception as e:  # noqa: BLE001
-                collected_errors.append({"exchange": source, "symbol": "*", "message": str(e)})
+    Parallel OKX+BTCTurk raced OKX network load into BTCTurk and made the UI feel
+  as slow as OKX even when BTCTurk would have won.
+    """
+    data, errors = _fallback_from_btcturk(symbols)
+    if data:
+        print(f"[ccxt-service] all btcturk-first: data={len(data)} (okx not called)")
+        return data, errors, ["btcturk"]
 
-        print(f"[ccxt-service] all-first-wins no data, first_source={first_source}")
-        return [], collected_errors, []
+    print("[ccxt-service] all btcturk-first: no btcturk rows, falling back to okx")
+    okx_data, okx_errors, used = _fetch_from_okx(symbols)
+    return okx_data, errors + okx_errors, used
 
 
 def _fallback_from_btcturk(symbols: list[str]) -> tuple[list[dict], list[dict]]:
@@ -246,9 +286,45 @@ def _fallback_from_btcturk(symbols: list[str]) -> tuple[list[dict], list[dict]]:
     return data, errors
 
 
+def _fetch_crypto_uncached(source: str, symbols: list[str]) -> tuple[list[dict], list[dict], list[str]]:
+    if source == "okx":
+        return _fetch_from_okx(symbols)
+    if source == "btcturk":
+        results, errors = _fallback_from_btcturk(symbols)
+        used_ccxt = ["btcturk"] if results else []
+        return results, errors, used_ccxt
+    return _fetch_all_btcturk_first(symbols)
+
+
+def _get_cached_crypto(source: str, symbols: list[str]) -> tuple[list[dict], list[dict], list[str]]:
+    if CACHE_TTL_SECONDS <= 0:
+        return _fetch_crypto_uncached(source, symbols)
+
+    now = time.monotonic()
+    with _cache_lock:
+        cached = _response_cache.get(source)
+        if cached and cached[0] > now:
+            payload = cached[1]
+            remaining_ms = int((cached[0] - now) * 1000)
+            print(f"[ccxt-service] cache hit source={source} ttl_remaining_ms={remaining_ms}")
+            return payload["results"], payload["errors"], payload["used_ccxt"]
+
+    results, errors, used_ccxt = _fetch_crypto_uncached(source, symbols)
+
+    expires_at = time.monotonic() + CACHE_TTL_SECONDS
+    entry = {"results": results, "errors": errors, "used_ccxt": used_ccxt}
+    with _cache_lock:
+        _response_cache[source] = (expires_at, entry)
+        # Warm btcturk cache when "all" used the same payload (faster filter switch in UI).
+        if source == "all" and used_ccxt == ["btcturk"]:
+            _response_cache["btcturk"] = (expires_at, entry)
+
+    return results, errors, used_ccxt
+
+
 @app.get("/fetch-crypto")
 def fetch_crypto():
-    """Kaynak secimine gore OKX/BTCTurk veya all-first-wins."""
+    """Kaynak secimine gore OKX/BTCTurk veya all=btcturk-first then okx fallback."""
     symbols = CCXT_SYMBOLS
     expected_symbols = set(symbols)
     source = (request.args.get("source", "all") or "all").strip().lower()
@@ -256,13 +332,7 @@ def fetch_crypto():
         source = "all"
     print(f"[ccxt-service] /fetch-crypto requested, source={source}, target_symbols={len(symbols)}")
 
-    if source == "okx":
-        results, errors, used_ccxt = _fetch_from_okx(symbols)
-    elif source == "btcturk":
-        results, errors = _fallback_from_btcturk(symbols)
-        used_ccxt = ["btcturk"] if results else []
-    else:
-        results, errors, used_ccxt = _fetch_all_first_wins(symbols)
+    results, errors, used_ccxt = _get_cached_crypto(source, symbols)
 
     deduped = []
     seen_symbols = set()

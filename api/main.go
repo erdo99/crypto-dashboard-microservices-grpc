@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	cryptopb "crypto-api/internal/gen/cryptopb"
@@ -40,12 +41,32 @@ func env(key, def string) string {
 	return v
 }
 
+var (
+	grpcClient     cryptopb.CryptoServiceClient
+	grpcClientOnce sync.Once
+	grpcClientErr  error
+)
+
+func getGRPCClient() (cryptopb.CryptoServiceClient, error) {
+	grpcClientOnce.Do(func() {
+		grpcAddr := env("CCXT_GRPC_ADDR", "localhost:50051")
+		conn, err := grpc.NewClient(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			grpcClientErr = err
+			log.Printf("[api] python grpc dial failed: %v", err)
+			return
+		}
+		grpcClient = cryptopb.NewCryptoServiceClient(conn)
+		log.Printf("[api] python grpc client ready at %s", grpcAddr)
+	})
+	return grpcClient, grpcClientErr
+}
+
 func fetchFromPython(source string) ([]CryptoData, []map[string]any, bool, error) {
-	grpcAddr := env("CCXT_GRPC_ADDR", "localhost:50051")
 	if source == "" {
 		source = "all"
 	}
-	log.Printf("[api] fetching python data from grpc://%s source=%s", grpcAddr, source)
+	log.Printf("[api] fetching python data source=%s", source)
 
 	timeoutSec, err := strconv.Atoi(env("PYTHON_GRPC_TIMEOUT_SECONDS", "45"))
 	if err != nil || timeoutSec <= 0 {
@@ -55,14 +76,10 @@ func fetchFromPython(source string) ([]CryptoData, []map[string]any, bool, error
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
-	conn, err := grpc.NewClient(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	client, err := getGRPCClient()
 	if err != nil {
-		log.Printf("[api] python grpc dial failed: %v", err)
 		return nil, []map[string]any{{"exchange": "python", "message": err.Error()}}, true, err
 	}
-	defer conn.Close()
-
-	client := cryptopb.NewCryptoServiceClient(conn)
 	resp, err := client.GetCryptoList(ctx, &cryptopb.GetCryptoListRequest{
 		Source: source,
 	})
