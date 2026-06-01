@@ -2,6 +2,7 @@ api/crypto-api.exe
 api/crypto-api
 frontend/node_modules
 frontend/dist
+*.tsbuildinfo
 **/__pycache__
 *.pyc
 .env

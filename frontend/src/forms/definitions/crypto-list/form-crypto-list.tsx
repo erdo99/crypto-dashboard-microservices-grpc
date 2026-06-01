@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { CRYPTO_LIST_FORM_PATH, fetchCryptoList } from '@/core/application/api/crypto-adapter';
 import { ResourceListPage } from '@/core/form/resource-list-page';
-import { useTheme } from '@/core/theme/theme-context';
+import { useTheme } from '@/core/theme/use-theme';
 import { Button } from '@/components/ui/button';
 import type { CryptoRow } from './types';
 import { buildCryptoColumns } from './crypto-columns';
